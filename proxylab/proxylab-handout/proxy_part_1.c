@@ -1,0 +1,222 @@
+#include <stdio.h>
+#include <ctype.h>
+#include <strings.h> // strcasecmp 在这里
+#include "csapp.h"
+
+/* Recommended max cache and object sizes */
+#define MAX_CACHE_SIZE 1049000
+#define MAX_OBJECT_SIZE 102400
+
+/* You won't lose style points for including this long line in your code */
+static const char *user_agent_hdr = "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:10.0.3) Gecko/20120305 Firefox/10.0.3\r\n";
+static const char *connection_hdr = "Connection: close\r\n";
+static const char *proxy_connection_hdr = "Proxy-Connection: close\r\n";
+
+/* 声明函数原型 */
+void doit(int fd);
+void read_requesthdrs(rio_t *rp,int serverfd,char *hostname);
+int parse_url(const char *url, char *hostname, char *port, char *uri);
+void clienterror(int fd, char *cause, char *errnum,char *shortmsg, char *longmsg);
+
+int main(int argc,char **argv)
+{
+    /* 不知道为什么要加这个 */
+    Signal(SIGPIPE, SIG_IGN); // 忽略 SIGPIPE 信号
+    int listenfd,connfd;
+    socklen_t clientlen;
+    struct sockaddr_storage clientaddr;
+
+    /* Check commond line args */
+    if(argc != 2){
+        fprintf(stderr, "usage: %s <port>\n", argv[0]);
+        exit(1);
+    }
+    /* 建立监听套接字 */
+    listenfd = Open_listenfd(argv[1]);
+    while(1){
+        clientlen = sizeof(clientaddr);
+        connfd = Accept(listenfd,(SA *)&clientaddr,&clientlen);
+        doit(connfd);
+        Close(connfd);
+    }
+
+
+}
+/*
+* 处理一个完整的Http请求
+*/
+void doit(int fd){
+    rio_t rio;
+    int serverfd;
+    char buf[MAXLINE],method[MAXLINE],url[MAXLINE],version[MAXLINE];
+    char hostname[MAXLINE],port[MAXLINE],uri[MAXLINE];
+    
+    /* 绑定客户端套接字和用户缓冲区，用于读取套接字内容 */
+    Rio_readinitb(&rio,fd);
+    if(!Rio_readlineb(&rio,buf,MAXLINE)){
+    return;
+    }
+    /* 解析报文首行,url是关键 */
+    if(sscanf(buf,"%s %s %s",method,url,version) != 3){
+        return;
+    }
+    
+    // 判断是否是GET请求
+    if (strcasecmp(method, "GET")) {
+    
+    clienterror(fd, method, "501", "Not Implemented",
+    "Proxy does not implement this method");
+    return;
+    }
+    
+    /* 从url中解析出Host([www.cmu.edu](http://www.cmu.edu/)),port,uri(home/index.html) */
+    if(parse_url(url,hostname,port,uri) == -1){
+        clienterror(fd, url, "400", "Bad Request","Invalid request format");
+        return;
+    }
+    /* 和目标服务器建立连接 */
+    serverfd = Open_clientfd(hostname,port);
+    if(serverfd < 0){
+        char addr[MAXLINE];
+        
+        sprintf(addr, "%s:%s", hostname, port);
+        
+        clienterror(fd, addr, "502", "Bad Gateway","Failed to connect to");
+        return;
+    }
+    
+    /* 向目标服务器转发请求报文 */
+    /* 转发报文首行：GET /home/index.html HTTP/1.0 */
+    char request_line[MAXLINE];
+    sprintf(request_line,"GET %s HTTP/1.0\r\n",uri);
+    Rio_writen(serverfd,request_line,strlen(request_line));
+    /* 构造并转发报文剩余部分 */
+    read_requesthdrs(&rio,serverfd,hostname);
+    
+    /* 从目标服务器读取请求报文并转发给客户端 */
+    rio_t server_rio;
+    Rio_readinitb(&server_rio,serverfd);
+    int n;
+
+    /* 这里替换成Rio_readnb,考虑到响应内容可能为二进制数据,Rio_readlineb用在文本数据 */
+    while ((n = Rio_readnb(&server_rio, buf, MAXLINE)) > 0) {
+        Rio_writen(fd, buf, n);
+    }
+    
+    /* 关闭和目标服务器的连接 */
+    Close(serverfd);
+}
+    
+
+void read_requesthdrs(rio_t *rp,int serverfd,char *hostname) {
+    char buf[MAXLINE];
+
+    /* Host头部 */
+    sprintf(buf,"Host: %s\r\n",hostname);
+    Rio_writen(serverfd,buf,strlen(buf));
+
+    /* 发送固定的头部:User-Agent,Connection,Proxy-Connection */
+    Rio_writen(serverfd,user_agent_hdr,strlen(user_agent_hdr));
+    Rio_writen(serverfd,connection_hdr,strlen(connection_hdr));
+    Rio_writen(serverfd,proxy_connection_hdr,strlen(proxy_connection_hdr));
+
+    /* 转发客户端请求头中的剩余行 */
+    Rio_readlineb(rp, buf, MAXLINE);
+    while(strcmp(buf, "\r\n")) {
+       if (strncasecmp(buf, "Host:", 5) && 
+        strncasecmp(buf, "User-Agent:", 11) &&
+        strncasecmp(buf, "Connection:", 11) &&
+        strncasecmp(buf, "Proxy-Connection:", 17)) 
+        {
+            Rio_writen(serverfd, buf, strlen(buf));
+        }
+        Rio_readlineb(rp, buf, MAXLINE);
+    }
+
+    /* 空行结束请求报文 */
+    Rio_writen(serverfd,"\r\n",2);
+
+}
+
+int parse_url(const char *url, char *hostname, char *port, char *uri){
+    // 验证URL是否以http://开头
+    if(strncmp(url,"http://",7) != 0){
+        return -1;
+    }
+    char *ptr = url + 7;
+    char *host_start = ptr;
+
+
+    //默认端口80
+    strcpy(port,"80");
+
+    // 查找第一个：或 /,确定hostname结束的位置
+    while(*ptr && *ptr != ':' && *ptr != '/'){
+        ptr++;
+    }
+
+    // 有端口号
+    if(*ptr == ':'){
+        int host_len = ptr - host_start;
+        strncpy(hostname,host_start,host_len);
+        hostname[host_len] = '\\0';
+
+        // 提取端口号
+        ptr++;
+        char *port_start = ptr;
+
+        while(*ptr && isdigit(*ptr)){
+            ptr++;
+        }
+        int port_len = ptr - port_start;
+        if(port_len > 0){
+            strncpy(port,port_start,port_len);
+            port[port_len] = '\\0';
+        }
+        // 此时ptr指向/或者字符串末尾
+
+    } else {
+        // 无端口号,直接提取hostname
+        int host_len = ptr - host_start;
+        strncpy(hostname, host_start, host_len);
+        hostname[host_len] = '\\0';
+    }
+    // 处理URI
+    if (*ptr == '/') {
+        strcpy(uri, ptr);
+    } else {
+        // 没有路径，使用根路径
+        strcpy(uri, "/");
+    }
+    return 0;
+
+}
+
+/*
+
+- clienterror - returns an error message to the client
+*/
+/* $begin clienterror */
+void clienterror(int fd, char *cause, char *errnum,char *shortmsg, char *longmsg)
+{
+    char buf[MAXLINE];
+    
+    /* Print the HTTP response headers */
+    sprintf(buf, "HTTP/1.0 %s %s\r\n", errnum, shortmsg);
+    Rio_writen(fd, buf, strlen(buf));
+    sprintf(buf, "Content-type: text/html\r\n\r\n");
+    Rio_writen(fd, buf, strlen(buf));
+    
+    /* Print the HTTP response body */
+    sprintf(buf, "<html><title>Tiny Error</title>");
+    Rio_writen(fd, buf, strlen(buf));
+    sprintf(buf, "<body bgcolor=""ffffff"">\r\n");
+    Rio_writen(fd, buf, strlen(buf));
+    sprintf(buf, "%s: %s\r\n", errnum, shortmsg);
+    Rio_writen(fd, buf, strlen(buf));
+    sprintf(buf, "<p>%s: %s\r\n", longmsg, cause);
+    Rio_writen(fd, buf, strlen(buf));
+    sprintf(buf, "<hr><em>The Tiny Web server</em>\r\n");
+    Rio_writen(fd, buf, strlen(buf));
+}
+    /* $end clienterror */
