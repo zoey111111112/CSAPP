@@ -19,12 +19,12 @@ typedef struct {
     sem_t items;
 } sbuf_t;
 
-typedef struct {
+typedef struct cache_item{
     int n;
     char *key;
     char *buf;
-    cache_item_t *prev;
-    cache_item_t *next;
+    struct cache_item *prev;
+    struct cache_item *next;
 } cache_item_t;
 
 /* You won't lose style points for including this long line in your code */
@@ -44,14 +44,13 @@ int sbuf_remove(sbuf_t *sp);
 void free_sbuf(sbuf_t *sp);
 int find_cache(char *key, int fd);
 void insert_to_head(cache_item_t *node);
-int find_content_length(rio_t *rio,char *temp);
 
 sbuf_t sbuf;
 int cache_size = 0;
 cache_item_t *head;
 cache_item_t *tail;
-int readcnt = 0, writecnt = 0;
-sem_t mutex1, mutex2, mutex3, r, w;
+pthread_rwlock_t cache_lock;
+pthread_rwlockattr_t attr;
 
 int main(int argc,char **argv)
 {
@@ -72,12 +71,11 @@ int main(int argc,char **argv)
     listenfd = Open_listenfd(argv[1]);
     /* 初始化缓冲区 */
     sbuf_init(&sbuf,SBUFZISE);
-    /* 初始化信号量 */
-    Sem_init(&mutex1,0,1);
-    Sem_init(&mutex2,0,1);
-    Sem_init(&mutex3,0,1);
-    Sem_init(&r,0,1);
-    Sem_init(&w,0,1);
+    // 初始化时设置为写者优先
+    pthread_rwlockattr_init(&attr);
+    pthread_rwlockattr_setkind_np(&attr,PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+    pthread_rwlock_init(&cache_lock, &attr);
+
     /* 初始化链表头尾节点 */
     head = NULL;
     tail = NULL;
@@ -107,7 +105,7 @@ void doit(int fd){
     /* 绑定客户端套接字和用户缓冲区，用于读取套接字内容 */
     Rio_readinitb(&rio,fd);
     if(!Rio_readlineb(&rio,buf,MAXLINE)){
-    return;
+        return;
     }
     /* 解析报文首行,url是关键 */
     if(sscanf(buf,"%s %s %s",method,url,version) != 3){
@@ -138,14 +136,11 @@ void doit(int fd){
         return;
     }
 
-
     /* 和目标服务器建立连接 */
     serverfd = Open_clientfd(hostname,port);
     if(serverfd < 0){
         char addr[MAXLINE];
-        
         sprintf(addr, "%s:%s", hostname, port);
-        
         clienterror(fd, addr, "502", "Bad Gateway","Failed to connect to");
         return;
     }
@@ -161,33 +156,35 @@ void doit(int fd){
     /* 从目标服务器读取请求报文并转发给客户端 */
     rio_t server_rio;
     Rio_readinitb(&server_rio,serverfd);
-    int n,sum;
-    char temp[MAXLINE];
-
-    sum = find_content_length(&server_rio,temp);
-
-    if(sum <= MAX_OBJECT_SIZE){
-        /* 为缓存项申请内存 */
-        char *cache_buf = Calloc(1,sum);
-        strcpy(cache_buf,temp);
-
-        Rio_writen(fd, temp, strlen(temp));
-        while ((n = Rio_readnb(&server_rio, buf, MAXLINE)) > 0) {
-            strcat(cache_buf,buf);
-            Rio_writen(fd, buf, n);
+    int n;
+    /* 为缓存项申请内存 */
+    char *cache_buf = Calloc(1,MAX_OBJECT_SIZE);
+    int cache_len = 0;
+    int success = 1;  // 标记是否成功处理
+    while ((n = Rio_readnb(&server_rio, buf, MAXLINE)) > 0) {
+        Rio_writen(fd, buf, n);
+        // 复制到缓存（只要还没超过大小）
+        if (cache_len + n <= MAX_OBJECT_SIZE) {
+            memcpy(cache_buf + cache_len, buf, n);
+            cache_len += n;
+        } else {
+            // 超过缓存大小，标记为不缓存，但继续转发
+            success = 0;
         }
-        /* 有没有必要申请内存 */
-        cache_item_t *item = Calloc(1,sizeof(cache_item_t));
-        item->key = strdup(key);
-        item->buf = cache_buf;
-        item->n = sum;
-        insert_to_head(item);
+    }
+    if (success && cache_len > 0) {  // 有内容且未超过大小
+        cache_item_t *item = Calloc(1, sizeof(cache_item_t));
+        if (item) {
+            item->key = strdup(key);
+            item->buf = cache_buf;  // 缓存接管缓冲区
+            item->n = cache_len;
+            insert_to_head(item);
+            // cache_buf 现在由缓存管理，不要释放
+        } else {
+            free(cache_buf);  // 内存分配失败，释放缓冲区
+        }
     } else {
-        Rio_writen(fd, temp, strlen(temp));
-        /* 这里替换成Rio_readnb,考虑到响应内容可能为二进制数据,Rio_readlineb用在文本数据 */
-        while ((n = Rio_readnb(&server_rio, buf, MAXLINE)) > 0) {
-            Rio_writen(fd, buf, n);
-        }
+        free(cache_buf);  // 不缓存，释放缓冲区
     }
     
     /* 关闭和目标服务器的连接 */
@@ -353,20 +350,12 @@ void *thread(void *vargp){
  * 直接传入 fd，避免额外的内存拷贝
  */
 int find_cache(char *key, int fd) {
+
+    pthread_rwlock_rdlock(&cache_lock);  // 加读锁
+
     int found = 0;
-
-    // --- 读者加锁逻辑 ---
-    P(&mutex3);
-    P(&r);               
-    P(&mutex1);
-    readcnt++;
-    if (readcnt == 1) 
-        P(&w);       
-    V(&mutex1);
-    V(&r);               
-    V(&mutex3);
-
     cache_item_t *p = head;
+
     while(p) {
         if(strcmp(p->key, key) == 0) {
             /* 命中：直接发送数据 */
@@ -377,62 +366,34 @@ int find_cache(char *key, int fd) {
         }
         p = p->next;
     }
-
-    // --- 读者解锁逻辑 (必须保证执行) ---
-    P(&mutex1);
-    readcnt--;
-    if (readcnt == 0) 
-        V(&w);           
-    V(&mutex1);
-
+    pthread_rwlock_unlock(&cache_lock);  // 解除读锁
     return found;
 }
 
 void insert_to_head(cache_item_t *node){
-    P(&mutex2);
-    writecnt++;
-    if (writecnt == 1) 
-        P(&r);           // 第一个写者到来时，锁住“大门”，阻止新读者
-    V(&mutex2);
-    P(&w);                 // 获取写权限（互斥）
+    pthread_rwlock_wrlock(&cache_lock);  // 加写锁
+
     /* 不断删除尾节点 */
     while((cache_size + node->n) > MAX_CACHE_SIZE){
-        cache_size -= tail->n;
-        free(tail->buf);
+        cache_item_t *victim = tail;  // 保存要删除的节点
         tail = tail->prev;
-        tail->next->prev = NULL;
         tail->next = NULL;
+        // 更新缓存大小
+        cache_size -= victim->n;
+        // 释放victim的资源
+        free(victim->buf);
+        free(victim->key);
+        free(victim);
     }
     node->next = head;
-    head->prev = node;
+    node->prev = NULL;
+    if(head) {
+        head->prev = node;
+    } else {
+        tail = node;
+    }
     head = node;
     cache_size += node->n;
-    V(&w);                   // 释放写权限
-    P(&mutex2);
-    writecnt--;
-    if (writecnt == 0) 
-        V(&r);           // 最后一个写者离开，重新开启“大门”允许读者进入
-    V(&mutex2);
-}
 
-int find_content_length(rio_t *rio,char *temp){
-    char buf[MAXLINE];
-    int sum = 0;
-    /* 分两部分读取：1.读取响应头，获得Content-Length 2.读取响应体 */
-    Rio_readlineb(rio, buf, MAXLINE);
-    strcpy(temp,buf);
-    while(strcmp(buf,"\r\n")){
-        if(strncasecmp(buf, "Content-Length:", 15) == 0){
-            const char* num_start = buf + 15;
-            // 跳过所有空白字符（空格、制表符等）
-            while (*num_start == ' ' || *num_start == '\t') {
-                num_start++;
-            }
-            sum = atoi(num_start);
-        }
-        Rio_readlineb(rio, buf, MAXLINE);
-        strcat(temp,buf);
-    }
-    return sum + strlen(temp);
+    pthread_rwlock_unlock(&cache_lock);  // 解除写锁
 }
-
